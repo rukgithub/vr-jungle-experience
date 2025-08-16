@@ -2,31 +2,636 @@
 <html lang="da">
 <head>
   <meta charset="UTF-8" />
-  <title>VR Jungle Oplevelse</title>
+  <title>VR Jungle Oplevelse – v2 (grænse + dag/nat + golf)</title>
 
-  <!-- A-Frame bibliotek (WebVR/WebXR framework) -->
+  <!-- A-Frame -->
   <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
-  <!-- A-Frame Extras for bevægelses-kontroller (joystick m.m.) -->
+
+  <!-- A-Frame Extras: movement-controls (joystick) -->
   <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-extras@7.6.0/dist/aframe-extras.min.js"></script>
-  <!-- Environment Component for proceduralt miljø (jungle/forest) -->
+
+  <!-- A-Frame Environment: terræn, træer, himmel mm. -->
   <script src="https://unpkg.com/aframe-environment-component@1.5.0/dist/aframe-environment-component.min.js"></script>
+
+  <style>
+    /* Kun til evt. non‑VR debug overlay-tekst */
+    .hud {
+      position: fixed; left: 12px; bottom: 10px; font: 12px/1.4 system-ui, sans-serif;
+      color:#fff; background: rgba(0,0,0,.35); padding: 6px 8px; border-radius: 6px;
+      user-select: none; pointer-events: none;
+    }
+  </style>
+
+  <script>
+  // ---------- Hjælpere ----------
+  const T = AFRAME.utils ? AFRAME.utils : THREE; // bare shorthand til THREE
+
+  function clamp(v, a, b){ return Math.min(b, Math.max(a, v)); }
+  function lerp(a, b, t){ return a + (b - a) * t; }
+  function lerpVec3(a, b, t){
+    return {x: lerp(a.x,b.x,t), y: lerp(a.y,b.y,t), z: lerp(a.z,b.z,t)};
+  }
+  function hexToRgb(h){
+    const s = h.replace('#','');
+    return { r: parseInt(s.substr(0,2),16), g: parseInt(s.substr(2,2),16), b: parseInt(s.substr(4,2),16) };
+  }
+  function rgbToHex(o){
+    const r = o.r|0, g = o.g|0, b = o.b|0;
+    return '#' + [r,g,b].map(x => ('0' + x.toString(16)).slice(-2)).join('');
+  }
+  function lerpColor(hexA, hexB, t){
+    const a = hexToRgb(hexA), b = hexToRgb(hexB);
+    return rgbToHex({ r: lerp(a.r,b.r,t), g: lerp(a.g,b.g,t), b: lerp(a.b,b.b,t) });
+  }
+
+  // ---------- Golf-system (deler lister mellem bolde/køller) ----------
+  AFRAME.registerSystem('golf', {
+    init(){ this.clubs = []; this.balls = []; },
+    registerClub(c){ this.clubs.push(c); },
+    unregisterClub(c){ this.clubs = this.clubs.filter(x => x !== c); },
+    registerBall(b){ this.balls.push(b); },
+    unregisterBall(b){ this.balls = this.balls.filter(x => x !== b); }
+  });
+
+  // ---------- Verden/Grænse/Spawn ----------
+  AFRAME.registerComponent('world-manager', {
+    schema: {
+      radius: {default: 500},     // standard radius (kan ændres via menu)
+      trees: {default: 160},      // antal ekstra lowpoly-træer
+      balls: {default: 8},        // antal golfbolde
+      clubs: {default: 3}         // antal køller
+    },
+    init(){
+      this.group = document.createElement('a-entity');
+      this.group.setAttribute('id','world-content');
+      this.el.appendChild(this.group);
+
+      // Stor ground-plane (uafhængig af environment)
+      this.ground = document.createElement('a-entity');
+      this.ground.setAttribute('rotation','-90 0 0');
+      this.ground.setAttribute('material','color: #5e7f3e; metalness: 0; roughness: 1');
+      this.group.appendChild(this.ground);
+
+      // Blødt "ring"-indikator nær grænsen
+      this.ring = document.createElement('a-entity');
+      this.ring.setAttribute('rotation','-90 0 0');
+      this.ring.setAttribute('material','color: #fff28e; opacity: 0.15; side: double');
+      this.group.appendChild(this.ring);
+
+      // Grupper
+      this.treesGroup = document.createElement('a-entity');
+      this.group.appendChild(this.treesGroup);
+      this.golfGroup = document.createElement('a-entity');
+      this.group.appendChild(this.golfGroup);
+
+      // Første opsætning
+      this.applyRadius(this.data.radius);
+      this.spawnTrees(this.data.trees);
+      this.spawnGolf(this.data.clubs, this.data.balls);
+
+      // Gør radius tilgængelig globalt
+      this.el.sceneEl.setAttribute('data-world-radius', this.data.radius);
+    },
+    update(old){
+      if(!old || old.radius !== this.data.radius){
+        this.applyRadius(this.data.radius);
+        this.el.sceneEl.setAttribute('data-world-radius', this.data.radius);
+      }
+    },
+    applyRadius(R){
+      // ground=plane med bredde=2R og højde=2R
+      this.ground.setAttribute('geometry', `primitive: plane; width: ${2*R}; height: ${2*R}`);
+      // ring=tynd torus/cirkel
+      this.ring.setAttribute('geometry', `primitive: ring; radiusInner: ${R-1}; radiusOuter: ${R+1}`);
+    },
+    randomXZ(R){
+      // ens sandsynlighed i cirkel (ikke kun i radius)
+      const r = Math.sqrt(Math.random()) * (R - 8);
+      const a = Math.random() * Math.PI * 2;
+      return { x: Math.cos(a)*r, z: Math.sin(a)*r };
+    },
+    spawnTrees(n){
+      // ryd eksisterende
+      while(this.treesGroup.firstChild) this.treesGroup.removeChild(this.treesGroup.firstChild);
+
+      for(let i=0;i<n;i++){
+        const p = this.randomXZ(this.data.radius);
+        const h = 2 + Math.random()*6; // højde
+        const trunk = document.createElement('a-entity');
+        trunk.setAttribute('position', `${p.x} 0 ${p.z}`);
+
+        // stamme
+        const s = document.createElement('a-entity');
+        s.setAttribute('geometry', `primitive: cylinder; radius: 0.12; height: ${h}`);
+        s.setAttribute('position', `0 ${h/2} 0`);
+        s.setAttribute('material', 'color: #6f4e37');
+        trunk.appendChild(s);
+
+        // krone
+        const k = document.createElement('a-entity');
+        k.setAttribute('geometry', `primitive: sphere; radius: ${0.7 + h*0.25}`);
+        k.setAttribute('position', `0 ${h} 0`);
+        k.setAttribute('material', 'color: #3a6b3a; metalness: 0; roughness: 1');
+        trunk.appendChild(k);
+
+        this.treesGroup.appendChild(trunk);
+      }
+    },
+    spawnGolf(clubs, balls){
+      // ryd eksisterende
+      while(this.golfGroup.firstChild) this.golfGroup.removeChild(this.golfGroup.firstChild);
+
+      // golfbolde
+      for(let i=0;i<balls;i++){
+        const p = this.randomXZ(this.data.radius*0.8);
+        const ball = document.createElement('a-entity');
+        ball.setAttribute('class','clickable');
+        ball.setAttribute('position', `${p.x} 0.05 ${p.z}`);
+        ball.setAttribute('golf-ball','');
+        ball.setAttribute('pickupable','kind: ball');
+        ball.setAttribute('geometry','primitive: sphere; radius: 0.045');
+        ball.setAttribute('material','color: #ffffff; metalness: 0; roughness: 0.6');
+        this.golfGroup.appendChild(ball);
+      }
+
+      // golfkøller (enkelt lowpoly-design)
+      for(let i=0;i<clubs;i++){
+        const p = this.randomXZ(this.data.radius*0.7);
+        const club = document.createElement('a-entity');
+        club.setAttribute('position', `${p.x} 0 ${p.z}`);
+        club.setAttribute('golf-club','');
+        club.setAttribute('pickupable','kind: club');
+
+        // Skaft
+        const shaft = document.createElement('a-entity');
+        shaft.setAttribute('geometry','primitive: cylinder; radius: 0.008; height: 1.0');
+        shaft.setAttribute('position','0 0.5 0');
+        shaft.setAttribute('material','color: #888888; metalness: 0.2; roughness: 0.5');
+        club.appendChild(shaft);
+
+        // Hoved (klods)
+        const head = document.createElement('a-entity');
+        head.classList.add('club-head');
+        head.setAttribute('geometry','primitive: box; depth: 0.24; height: 0.05; width: 0.08');
+        head.setAttribute('position','0.07 0.05 -0.24');
+        head.setAttribute('material','color: #303030; metalness: .5; roughness: .2');
+        club.appendChild(head);
+
+        // Læg køllen fladt på jorden
+        club.setAttribute('rotation','0 30 8');
+
+        this.golfGroup.appendChild(club);
+      }
+    }
+  });
+
+  // ---------- Kamera-grænse (klamper rig indenfor radius) ----------
+  AFRAME.registerComponent('boundary-limiter', {
+    schema: { margin: {default: 0.5} },
+    init(){
+      this.r = +this.el.sceneEl.getAttribute('data-world-radius') || 500;
+      this.tmp = new THREE.Vector3();
+      // Lyt efter radius-ændringer
+      const observer = new MutationObserver(() =>{
+        const val = +this.el.sceneEl.getAttribute('data-world-radius');
+        if(val) this.r = val;
+      });
+      observer.observe(this.el.sceneEl, { attributes:true });
+      this._obs = observer;
+    },
+    remove(){ if(this._obs) this._obs.disconnect(); },
+    tick(){
+      const p = this.el.object3D.position;
+      const dist = Math.hypot(p.x, p.z);
+      const r = Math.max(1, this.r - this.data.margin);
+      if(dist > r){
+        const k = r / dist;
+        p.x *= k; p.z *= k;
+      }
+    }
+  });
+
+  // ---------- Start-menu (vælg radius) ----------
+  AFRAME.registerComponent('start-menu', {
+    init(){
+      const menu = this.el;
+      const mkBtn = (x, y, label, radius) => {
+        const btn = document.createElement('a-entity');
+        btn.classList.add('clickable');
+        btn.setAttribute('position', `${x} ${y} 0`);
+        btn.setAttribute('geometry','primitive: plane; width: 0.9; height: 0.28');
+        btn.setAttribute('material','color: #1e293b; opacity: 0.9');
+        const txt = document.createElement('a-text');
+        txt.setAttribute('value', `${label} (${radius} m)`);
+        txt.setAttribute('align','center');
+        txt.setAttribute('color','#ffffff');
+        txt.setAttribute('width','1.6');
+        txt.setAttribute('position','0 0 0.01');
+        btn.appendChild(txt);
+        btn.addEventListener('click', () => this.applyRadius(radius));
+        menu.appendChild(btn);
+      };
+
+      // Panel-baggrund
+      const bg = document.createElement('a-entity');
+      bg.setAttribute('geometry','primitive: plane; width: 2.6; height: 1.6');
+      bg.setAttribute('material','color: #0b1220; opacity: 0.8');
+      bg.setAttribute('position','0 0 0');
+      this.el.appendChild(bg);
+
+      // Overskrift
+      const title = document.createElement('a-text');
+      title.setAttribute('value','Vælg verdens-størrelse');
+      title.setAttribute('color','#fff');
+      title.setAttribute('align','center');
+      title.setAttribute('width','2.6');
+      title.setAttribute('position','0 0.6 0.01');
+      this.el.appendChild(title);
+
+      // Knapper
+      mkBtn(-0.85, 0.15, 'Mellem', 500);
+      mkBtn( 0.85, 0.15, 'Stor', 1000);
+      mkBtn(-0.85,-0.35, 'XL', 1500);
+      mkBtn( 0.85,-0.35, 'Gigantisk', 2500);
+
+      // Instruktion
+      const hint = document.createElement('a-text');
+      hint.setAttribute('value','Tip: Brug joystick til at gå; grib (grip) for at samle op; klik en knap for at starte');
+      hint.setAttribute('color','#a7f3d0');
+      hint.setAttribute('align','center');
+      hint.setAttribute('width','2.4');
+      hint.setAttribute('position','0 -0.7 0.01');
+      this.el.appendChild(hint);
+    },
+    applyRadius(R){
+      // Opdatér world-manager og boundary
+      const world = document.querySelector('#world');
+      world.setAttribute('world-manager', `radius: ${R}`);
+      const rig = document.querySelector('#cameraRig');
+      rig.setAttribute('boundary-limiter',''); // (genaktiverer hvis fjernet)
+      rig.sceneEl.setAttribute('data-world-radius', R);
+
+      // Skjul menu
+      this.el.setAttribute('visible','false');
+    }
+  });
+
+  // ---------- Dag/Nat + stjerner ----------
+  AFRAME.registerComponent('starfield', {
+    schema: { radius: {default: 1200}, count: {default: 2000} },
+    init(){
+      const r = this.data.radius, n = this.data.count;
+      const geo = new THREE.BufferGeometry();
+      const pos = new Float32Array(n*3);
+      for(let i=0;i<n;i++){
+        const a = Math.random()*Math.PI*2;
+        const b = Math.acos(2*Math.random()-1);
+        pos[i*3+0] = r * Math.sin(b) * Math.cos(a);
+        pos[i*3+1] = r * Math.cos(b);
+        pos[i*3+2] = r * Math.sin(b) * Math.sin(a);
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+      const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 1.2, sizeAttenuation: true, transparent: true, opacity: 0.0 });
+      const pts = new THREE.Points(geo, mat);
+      this.el.setObject3D('mesh', pts);
+      this.points = pts;
+      this.opacityTarget = 0.0;
+    },
+    setOpacity(a){ 
+      this.opacityTarget = clamp(a,0,1);
+    },
+    tick(time,dt){
+      if(!this.points) return;
+      // Langsom rotation
+      this.points.rotation.y += (dt||16) * 0.00002;
+      // Blød fade
+      const m = this.points.material;
+      m.opacity = lerp(m.opacity, this.opacityTarget, 0.02);
+      this.el.setAttribute('visible', m.opacity > 0.02);
+    }
+  });
+
+  AFRAME.registerComponent('day-night-cycle', {
+    schema: { minutesPerCycle: {default: 3.5} },
+    init(){
+      this.t = 0; // 0..1
+      this.env = document.querySelector('#env');
+      this.sun = document.querySelector('#sun');
+      this.amb = document.querySelector('#amb');
+      this.stars = document.querySelector('#stars');
+    },
+    colorsAt(t){
+      // Faser: 0-0.18 dawn, 0.18-0.45 day, 0.45-0.6 noon, 0.6-0.82 sunset, 0.82-1 night
+      const C = {
+        dawn:   { sky:'#f2b57e', hor:'#ffd79a' },
+        day:    { sky:'#8ec5ff', hor:'#bfe9ff' },
+        noon:   { sky:'#6bbcff', hor:'#b9ecff' },
+        sunset: { sky:'#f09372', hor:'#f6bf84' },
+        night:  { sky:'#070b1a', hor:'#0b1a2b' }
+      };
+      let sky, hor, elevDeg, sunI, ambI, starA;
+
+      function seg(a,b){ return clamp((t-a)/(b-a), 0, 1); }
+
+      if(t < 0.18){ // dawn
+        const f = seg(0.0,0.18);
+        sky   = lerpColor(C.night.sky,  C.dawn.sky,   f);
+        hor   = lerpColor(C.night.hor,  C.dawn.hor,   f);
+        elevDeg = lerp(-10, 20, f);
+        sunI = lerp(0.02, 0.6, f);
+        ambI = lerp(0.05, 0.25, f);
+        starA = 1.0 - f;
+      } else if(t < 0.45){ // day
+        const f = seg(0.18,0.45);
+        sky   = lerpColor(C.dawn.sky,  C.day.sky,   f);
+        hor   = lerpColor(C.dawn.hor,  C.day.hor,   f);
+        elevDeg = lerp(20, 60, f);
+        sunI = lerp(0.6, 1.0, f);
+        ambI = lerp(0.25,0.35,f);
+        starA = 0.0;
+      } else if(t < 0.6){ // noon
+        const f = seg(0.45,0.6);
+        sky   = lerpColor(C.day.sky,  C.noon.sky,   f);
+        hor   = lerpColor(C.day.hor,  C.noon.hor,   f);
+        elevDeg = lerp(60, 75, f);
+        sunI = lerp(1.0, 1.15, f);
+        ambI = lerp(0.35, 0.4, f);
+        starA = 0.0;
+      } else if(t < 0.82){ // sunset
+        const f = seg(0.6,0.82);
+        sky   = lerpColor(C.noon.sky,  C.sunset.sky,   f);
+        hor   = lerpColor(C.noon.hor,  C.sunset.hor,   f);
+        elevDeg = lerp(75, -5, f);
+        sunI = lerp(1.15, 0.05, f);
+        ambI = lerp(0.4, 0.1, f);
+        starA = 0.0;
+      } else { // night
+        const f = seg(0.82,1.0);
+        sky   = lerpColor(C.sunset.sky,  C.night.sky,   f);
+        hor   = lerpColor(C.sunset.hor,  C.night.hor,   f);
+        elevDeg = -5;
+        sunI = 0.02;
+        ambI = 0.06;
+        starA = f;
+      }
+      return {sky, hor, elevDeg, sunI, ambI, starA};
+    },
+    tick(time, dt){
+      const dur = this.data.minutesPerCycle * 60 * 1000;
+      this.t = (this.t + (dt||16)/dur) % 1;
+
+      const S = this.colorsAt(this.t);
+
+      // Opdatér environment (himmel + sol-retning)
+      this.env.setAttribute('environment', {
+        skyType: 'gradient',
+        skyColor: S.sky,
+        horizonColor: S.hor,
+        sunPosition: {x: 0.0, y: Math.sin(THREE.MathUtils.degToRad(S.elevDeg)), z: Math.cos(THREE.MathUtils.degToRad(S.elevDeg))}
+      });
+
+      // Lys
+      this.sun.setAttribute('light', `type: directional; intensity: ${S.sunI}; castShadow: true`);
+      // placér solen i himlen (retningen betyder mest)
+      const r = 40;
+      const y = Math.sin(THREE.MathUtils.degToRad(S.elevDeg))*r;
+      const z = Math.cos(THREE.MathUtils.degToRad(S.elevDeg))*r;
+      this.sun.setAttribute('position', `0 ${y} ${z}`);
+      this.sun.object3D.lookAt(0,0,0);
+
+      this.amb.setAttribute('light', `type: ambient; intensity: ${S.ambI}; color: #ffffff`);
+
+      // Stjerner (fade ind/ud)
+      this.stars.components.starfield && this.stars.components.starfield.setOpacity(S.starA);
+    }
+  });
+
+  // ---------- Simple "pickup" (grib/drop) ----------
+  AFRAME.registerComponent('pickupable', {
+    schema: { kind: {default: 'generic'} },
+    init(){ this.isGrabbed = false; },
+    pickup(byEl){
+      this.isGrabbed = true;
+      this.grabbedBy = byEl;
+      // Læg i hånden med lille offset frem
+      this.el.object3D.position.set(0, -0.05, -0.25);
+      this.el.object3D.rotation.set(0, 0, 0);
+      byEl.object3D.add(this.el.object3D);
+      this.el.emit('pickedup', {by: byEl});
+    },
+    dropToWorld(worldEl, worldPos, worldQuat){
+      // Løsriv fra hånd og placer i verden
+      worldEl.object3D.add(this.el.object3D);
+      this.el.object3D.position.copy(worldPos);
+      this.el.object3D.quaternion.copy(worldQuat);
+      this.isGrabbed = false;
+      this.el.emit('dropped', {});
+    }
+  });
+
+  // ---------- Controller som kan gribe ting ----------
+  AFRAME.registerComponent('grabber', {
+    schema: { hand: {default: 'right'} },
+    init(){
+      this.held = null;
+      this.prev = new THREE.Vector3();
+      this.curr = new THREE.Vector3();
+      this.vel  = new THREE.Vector3();
+      this.el.addEventListener('gripdown', ()=>this.tryGrab());
+      this.el.addEventListener('gripup', ()=>this.release());
+      this.el.object3D.getWorldPosition(this.prev);
+    },
+    tick(time, dt){
+      // beregn håndens hastighed (til at give bolden fart når vi slipper)
+      this.el.object3D.getWorldPosition(this.curr);
+      const s = (dt||16) / 1000;
+      if(s>0){
+        this.vel.copy(this.curr).sub(this.prev).multiplyScalar(1/s);
+      }
+      this.prev.copy(this.curr);
+    },
+    findNearestPickup(){
+      const all = Array.from(this.el.sceneEl.querySelectorAll('[pickupable]'));
+      let best = null, bestD = 0.22; // gribe-radius
+      const hp = new THREE.Vector3(); this.el.object3D.getWorldPosition(hp);
+      for(const e of all){
+        const p = new THREE.Vector3(); e.object3D.getWorldPosition(p);
+        const d = hp.distanceTo(p);
+        const comp = e.components.pickupable;
+        if(comp && !comp.isGrabbed && d < bestD){ bestD = d; best = e; }
+      }
+      return best;
+    },
+    tryGrab(){
+      if(this.held) return;
+      const ent = this.findNearestPickup();
+      if(!ent) return;
+      ent.components.pickupable.pickup(this.el);
+      this.held = ent;
+    },
+    release(){
+      if(!this.held) return;
+      const world = document.querySelector('#world');
+      // hvor slipper hånden?
+      const pos = new THREE.Vector3();
+      const dir = new THREE.Vector3();
+      this.el.object3D.getWorldPosition(pos);
+      this.el.object3D.getWorldDirection(dir);
+      pos.addScaledVector(dir, 0.20); // lidt foran hånden
+      const quat = this.el.object3D.getWorldQuaternion(new THREE.Quaternion());
+
+      // drop til verden
+      this.held.components.pickupable.dropToWorld(world, pos, quat);
+
+      // hvis det er en bold: giv den fart
+      if(this.held.components['golf-ball']){
+        this.held.components['golf-ball'].setVelocity(this.vel);
+      }
+      this.held = null;
+    }
+  });
+
+  // ---------- Golf-kølle (tracker køllehovedets hastighed) ----------
+  AFRAME.registerComponent('golf-club', {
+    init(){
+      this.system.registerClub(this);
+      this.head = this.el.querySelector('.club-head');
+      this.prev = new THREE.Vector3();
+      this.vel  = new THREE.Vector3();
+      (this.head || this.el).object3D.getWorldPosition(this.prev);
+      this.el.addEventListener('remove', ()=>this.system.unregisterClub(this));
+    },
+    tick(time, dt){
+      if(!this.head) return;
+      const p = new THREE.Vector3();
+      this.head.object3D.getWorldPosition(p);
+      const s = (dt||16)/1000;
+      if(s>0){
+        this.vel.copy(p).sub(this.prev).multiplyScalar(1/s);
+      }
+      this.prev.copy(p);
+    }
+  });
+
+  // ---------- Golf-bold (let fysik + sammenstød med kølle) ----------
+  AFRAME.registerComponent('golf-ball', {
+    init(){
+      this.system.registerBall(this);
+      this.v = new THREE.Vector3(0,0,0);
+      this.tmp = new THREE.Vector3();
+      this.r = 0.045; // radius
+      this.lastHitT = 0;
+      this.el.addEventListener('remove', ()=>this.system.unregisterBall(this));
+    },
+    setVelocity(v3){ this.v.copy(v3); },
+    tick(time, dt){
+      const s = (dt||16)/1000;
+      const R = +this.el.sceneEl.getAttribute('data-world-radius') || 500;
+      const obj = this.el.object3D;
+      const p = obj.position;
+
+      // Gravitations- og luftmodstand
+      this.v.y -= 9.81 * s;
+      this.v.multiplyScalar(0.999); // let drag
+
+      // Flyt
+      p.addScaledVector(this.v, s);
+
+      // Kollision mod ground (y=0)
+      if(p.y < this.r){
+        p.y = this.r;
+        if(this.v.y < 0) this.v.y *= -0.45; // hop
+        this.v.x *= 0.985; this.v.z *= 0.985; // rul-friktion
+        // stop helt hvis meget langsom
+        if(this.v.lengthSq() < 0.001) this.v.set(0,0,0);
+      }
+
+      // Blød verdensgrænse (reflekter xz)
+      const d = Math.hypot(p.x, p.z);
+      if(d > R - 0.2){
+        const k = (R - 0.2) / d;
+        p.x *= k; p.z *= k;
+        // reflekter hastighed i planet
+        const nx = p.x/d, nz = p.z/d;
+        const vDotN = this.v.x*nx + this.v.z*nz;
+        this.v.x -= 1.8 * vDotN * nx;
+        this.v.z -= 1.8 * vDotN * nz;
+        this.v.multiplyScalar(0.8);
+      }
+
+      // Slag fra køllehoved
+      const now = performance.now();
+      if(now - this.lastHitT > 120){ // cooldown 120ms
+        for(const club of this.system.clubs){
+          if(!club.head) continue;
+          const hp = new THREE.Vector3();
+          club.head.object3D.getWorldPosition(hp);
+          const dist = hp.distanceTo(obj.getWorldPosition(this.tmp));
+          if(dist < (this.r + 0.09)){
+            const spd = club.vel.length();
+            if(spd > 0.3){
+              const dir = club.vel.clone().normalize();
+              // Skub fremad + en smule op
+              this.v.addScaledVector(dir, spd * 0.9);
+              this.v.y += spd * 0.18;
+              this.lastHitT = now;
+              break;
+            }
+          }
+        }
+      }
+    }
+  });
+  </script>
 </head>
+
 <body>
-  <!-- A-Frame scene definition -->
-  <a-scene background="color: #ECECEC">
-    <!-- Proceduralt jungle-miljø -->
-    <a-entity environment="preset: forest; dressing: trees; dressingAmount: 50; 
-                           fog: 0.5; shadow: true;">
+  <div class="hud">VR-tip: Klik “Enter VR”. Joystick = gå. Grip = grib/slip. Peg med stråle for at trykke på knapper.</div>
+
+  <a-scene renderer="colorManagement: true; physicallyCorrectLights: true">
+
+    <!-- Proceduralt jungle-miljø (vi overskriver farver/sol via day-night-cycle) -->
+    <a-entity id="env"
+      environment="preset: forest; skyType: gradient; horizonColor: #bfe9ff; skyColor: #8ec5ff;
+                   dressing: trees; dressingAmount: 60; shadow: true; fog: 0.35;">
     </a-entity>
 
-    <!-- Kamera + controller rig for bevægelse -->
-    <a-entity id="cameraRig" movement-controls>
-      <!-- Kamera (spillerens perspektiv) -->
-      <a-entity camera position="0 1.6 0" look-controls></a-entity>
-      <!-- Venstre og højre håndkontroller (for Quest/Oculus) -->
-      <a-entity oculus-touch-controls="hand: left"></a-entity>
-      <a-entity oculus-touch-controls="hand: right"></a-entity>
+    <!-- Verden (ground, ekstra træer, golf mm.) -->
+    <a-entity id="world" world-manager="radius: 500; trees: 160; clubs: 3; balls: 8"></a-entity>
+
+    <!-- Lys -->
+    <a-entity id="sun" position="0 20 10" light="type: directional; intensity: 1.0; castShadow: true"></a-entity>
+    <a-entity id="amb" light="type: ambient; intensity: 0.35; color: #ffffff"></a-entity>
+
+    <!-- Stjerner (tegnes som partikler på indersiden af en stor kugle) -->
+    <a-entity id="stars" starfield="radius: 1200; count: 2400" visible="false"></a-entity>
+
+    <!-- Kamera + bevægelse + controllere -->
+    <a-entity id="cameraRig" movement-controls boundary-limiter>
+      <a-entity id="camera" camera position="0 1.6 0" look-controls cursor="rayOrigin: mouse"></a-entity>
+
+      <!-- Venstre og højre hånd: laser + grip -->
+      <a-entity id="leftHand"
+        oculus-touch-controls="hand: left"
+        laser-controls="hand: left"
+        cursor="rayOrigin: entity"
+        raycaster="objects: .clickable"
+        grabber="hand: left"></a-entity>
+
+      <a-entity id="rightHand"
+        oculus-touch-controls="hand: right"
+        laser-controls="hand: right"
+        cursor="rayOrigin: entity"
+        raycaster="objects: .clickable"
+        grabber="hand: right"></a-entity>
     </a-entity>
+
+    <!-- Startmenu til at vælge verdensstørrelse -->
+    <a-entity id="startMenu" position="0 1.6 -2" start-menu class="clickable"></a-entity>
+
+    <!-- Dag/nat-cyklus styres på scenen -->
+    <a-entity day-night-cycle="minutesPerCycle: 4.0"></a-entity>
+
   </a-scene>
 </body>
 </html>
